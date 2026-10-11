@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+import math
+
+class InputEmbedding(nn.Module):
+    def __init__(self, d_model: int, vocab_size: int):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+    def forward(self, x):
+        return self.embedding(x)*math.sqrt(self.d_model)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, seq_len: int, dropout :float= 0.25) ->None:
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        self.dropout = nn.Dropout(dropout)
+
+        #create a matric of shape (seq_len, d_model)
+        pe = torch.zeros(seq_len, d_model)
+        #create vector of shape(seq_len)
+        posn = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        denominator = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000)/d_model))
+        pe[:,0::2] = torch.sin(posn*denominator)
+        pe[:, 1::2] = torch.cos(posn*denominator)
+        pe = pe.unsqueeze(0); #(batch_len, seq_len, d_model)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
+        return self.dropout(x)
+
+    
+
+class LayerNormalization(nn.Module):
+    def __init__(self, eps: float=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.bias = nn.Parameter(torch.zeros(1))
+        #alpha*x+bias
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        return self.alpha*((x-mean)/ std) + self.bias
+
+class FeedForwardBlock(nn.Module):
+    def __init__(self, d_model: int,d_ff :int, dropout: float):
+        super().__init__()
+        self.linear_1 = nn.Linear(d_model, d_ff) #W_1 & b_1
+        self.dropout = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        # (Batch, seq_len, d_model) -> (Batch, seq_len, d_ff) -> (Batch, seq_len, d_model)
+        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
+        #W2* ReLU(W1*x+b1) + b2
+
+class MultiHeadAttentionBlock(nn.Module):
+    def __init__(self, d_model :int, h :int, dropout :float=0.25):
+        super().__init__()
+        self.d_model = d_model
+        self.h= h
+        self.dropout= nn.Dropout(dropout)
+        assert d_model %h==0,  f"d_model{d_model} is not divisble by h{h}"
+
+        self.d_k = d_model//h
+
+        self.Q = nn.Linear(d_model, d_model)
+        self.K = nn.Linear(d_model, d_model)
+        self.V = nn.Linear(d_model, d_model)
+
+        self.W_o = nn.Linear(d_model, d_model) #(d_model, d_k*h)
+
+    @staticmethod
+    def attention(query, key, value, mask, dropout: nn.Dropout):
+        d_k = query.shape[-1]
+
+        #(_nbatch, h, _nseq, d_k) -> (_nbatch, h, _nseq, _nseq)
+        attention_scores = (query@key.transpose(-2, -1))/math.sqrt(d_k)
+        if mask is not None:
+            attention_scores.masked_fill_(mask==0, -1e9)
+
+        attention_scores = attention_scores.softmax(dim=-1) #(batch, h, seq_len, seq_len)
+        if dropout is not None:
+            attention_scores = dropout(attention_scores)
+
+        return (attention_scores@value), attention_scores
+
+    def forward(self, q, k, v, mask):
+
+        #(_nbatch, _nseq, d_model)
+        query = self.Q(q)
+        key = self.K(k)
+        value = self.V(v)
+
+        #(_batch, _nseq, d_model) -> (_nbatch, _nseq, h, d_k) -> (_nbatch, h, _nseq, d_k)
+        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1,2)
+        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1,2)
+        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1,2)
+
+        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+
+        #(_nbatch, h, _nseq, d_k) -> (_nbatch, _nseq, h, d_k)
+        x = x.transpose(1,2).contiguous().view(x.shape[0], -1, self.h*self.d_k)
+
+        #(_batch, _nseq, d_model) -> (_batch, _nseq, d_model)
+        return self.W_o(x)
+
+class ResidualConnection(nn.Module):
+    def __init__(self, dropout :float):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = LayerNormalization()
+
+    def forward(self, x, sublayer):
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, 
+               self_attention_block :MultiHeadAttentionBlock,
+                feed_forward_block :FeedForwardBlock,
+                dropout :float):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connection = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
+
+    def forward(self, x, src_mask):
+        x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
+        x = self.residual_connection[1](x, self.feed_forward_block)
+        return x
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, 
+                 self_attention_block :MultiHeadAttentionBlock, 
+                 cross_attention_block :MultiHeadAttentionBlock,
+                 feed_forward_block :FeedForwardBlock,
+                 dropout :float):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.cross_attention_block = cross_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connection = nn.ModuleList(ResidualConnection(dropout) for _ in range(3))
+
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        x = self.residual_connection[0](x, lambda x: self.self_attention_block(x,x,x,tgt_mask))
+        x = self.residual_connection[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
+        x = self.residual_connection[22](x, self.feed_forward_block)
+
+        return x
+    
+
